@@ -6,6 +6,7 @@ from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import copy
+from joblib import Parallel, delayed
 
 class DSTARS(BaseEstimator, RegressorMixin):
     """
@@ -28,13 +29,14 @@ class DSTARS(BaseEstimator, RegressorMixin):
     random_state : int, default=None
         Random state for reproducibility.
     """
-    def __init__(self, base_estimator=None, epsilon=1e-4, phi=0.4, n_folds_tracking=10, method='DSTARST', random_state=None):
+    def __init__(self, base_estimator=None, epsilon=1e-4, phi=0.4, n_folds_tracking=10, method='DSTARST', random_state=None, n_jobs=1):
         self.base_estimator = base_estimator if base_estimator is not None else RandomForestRegressor(n_estimators=100, random_state=random_state)
         self.epsilon = epsilon
         self.phi = phi
         self.n_folds_tracking = n_folds_tracking
         self.method = method
         self.random_state = random_state
+        self.n_jobs = n_jobs
         self.convergence_layers_ = None
         self.rf_importance_ = None
         self.models_ = {}
@@ -81,19 +83,26 @@ class DSTARS(BaseEstimator, RegressorMixin):
         preds_train = np.zeros((X_train.shape[0], self.n_targets_))
         preds_val = np.zeros((X_val.shape[0], self.n_targets_))
         
-        for i in range(self.n_targets_):
+        def _train_predict_single_target(i, X_train_fold, y_train_fold, X_val_fold):
             model = clone(self.base_estimator)
-            model.fit(X_train, y_train[:, i])
-            preds_train[:, i] = model.predict(X_train)
-            preds_val[:, i] = model.predict(X_val)
+            model.fit(X_train_fold, y_train_fold[:, i])
+            return model.predict(X_train_fold), model.predict(X_val_fold), model
+
+        results = Parallel(n_jobs=self.n_jobs)(delayed(_train_predict_single_target)(i, X_train, y_train, X_val) for i in range(self.n_targets_))
+        
+        for i, (p_train, p_val, model) in enumerate(results):
+            preds_train[:, i] = p_train
+            preds_val[:, i] = p_val
+            self.models_[i] = model # Store models for final prediction
             
         # RF Importance
         self.rf_importance_ = []
-        for i in range(self.n_targets_):
+        def _calculate_rf_importance(i, preds_val_fold, y_val_fold):
             rf_aux = RandomForestRegressor(n_estimators=100, random_state=self.random_state)
-            rf_aux.fit(preds_val, y_val[:, i])
-            importances = rf_aux.feature_importances_
-            self.rf_importance_.append(importances > 0)
+            rf_aux.fit(preds_val_fold, y_val_fold[:, i])
+            return rf_aux.feature_importances_ > 0
+
+        self.rf_importance_ = Parallel(n_jobs=self.n_jobs)(delayed(_calculate_rf_importance)(i, preds_val, y_val) for i in range(self.n_targets_))
             
         # Tracking
         converged = np.array([all(~self.rf_importance_[i][np.arange(self.n_targets_) != i]) for i in range(self.n_targets_)])
@@ -161,21 +170,28 @@ class DSTARS(BaseEstimator, RegressorMixin):
         
         # Initial ST predictions for RF Importance
         st_preds = np.zeros_like(y)
-        for train_idx, val_idx in kf.split(X):
-            X_t, y_t = X[train_idx], y[train_idx]
-            X_v = X[val_idx]
-            for i in range(self.n_targets_):
-                model = clone(self.base_estimator)
-                model.fit(X_t, y_t[:, i])
-                st_preds[val_idx, i] = model.predict(X_v)
+
+        def _train_predict_fold(fold_train_idx, fold_val_idx, X_full, y_full, target_idx):
+            X_t, y_t = X_full[fold_train_idx], y_full[fold_train_idx]
+            X_v = X_full[fold_val_idx]
+            model = clone(self.base_estimator)
+            model.fit(X_t, y_t[:, target_idx])
+            return fold_val_idx, target_idx, model.predict(X_v)
+
+        results = Parallel(n_jobs=self.n_jobs)(delayed(_train_predict_fold)(
+            train_idx, val_idx, X, y, i
+        ) for train_idx, val_idx in kf.split(X) for i in range(self.n_targets_))
+
+        for val_idx, target_idx, predictions in results:
+            st_preds[val_idx, target_idx] = predictions
                 
         # RF Importance
-        self.rf_importance_ = []
-        for i in range(self.n_targets_):
+        def _calculate_rf_importance(i, st_preds_fold, y_fold):
             rf_aux = RandomForestRegressor(n_estimators=100, random_state=self.random_state)
-            rf_aux.fit(st_preds, y[:, i])
-            importances = rf_aux.feature_importances_
-            self.rf_importance_.append(importances > 0)
+            rf_aux.fit(st_preds_fold, y_fold[:, i])
+            return rf_aux.feature_importances_ > 0
+
+        self.rf_importance_ = Parallel(n_jobs=self.n_jobs)(delayed(_calculate_rf_importance)(i, st_preds, y) for i in range(self.n_targets_))
             
         # Tracking with CV
         fold_convergence_layers = np.zeros((self.n_folds_tracking, self.n_targets_), dtype=int)
@@ -188,11 +204,16 @@ class DSTARS(BaseEstimator, RegressorMixin):
             # Layer 0
             preds_train = np.zeros((X_train.shape[0], self.n_targets_))
             preds_val = np.zeros((X_val.shape[0], self.n_targets_))
-            for i in range(self.n_targets_):
+
+            def _train_predict_layer0(i, X_train_fold, y_train_fold, X_val_fold):
                 model = clone(self.base_estimator)
-                model.fit(X_train, y_train[:, i])
-                preds_train[:, i] = model.predict(X_train)
-                preds_val[:, i] = model.predict(X_val)
+                model.fit(X_train_fold, y_train_fold[:, i])
+                return model.predict(X_train_fold), model.predict(X_val_fold)
+
+            results_layer0 = Parallel(n_jobs=self.n_jobs)(delayed(_train_predict_layer0)(i, X_train, y_train, X_val) for i in range(self.n_targets_))
+            for i, (p_train, p_val) in enumerate(results_layer0):
+                preds_train[:, i] = p_train
+                preds_val[:, i] = p_val
             
             error_val = np.array([self._get_rmse(y_val[:, i], preds_val[:, i]) for i in range(self.n_targets_)])
             conv_layers = np.zeros(self.n_targets_, dtype=int)
@@ -202,48 +223,47 @@ class DSTARS(BaseEstimator, RegressorMixin):
             all_preds_val = {0: preds_val}
             
             rlayer = 1
+            def _train_predict_tracking(i, converged_i, rf_imp_i, X_train_fold, y_train_fold, X_val_fold, y_val_fold, conv_layers_fold, all_preds_train_fold, all_preds_val_fold, error_val_i):
+                if not converged_i:
+                    chosen_targets = np.where(rf_imp_i)[0]
+                    X_tra_ext = X_train_fold.copy()
+                    X_val_ext = X_val_fold.copy()
+                    for ct in chosen_targets:
+                        dep_layer = conv_layers_fold[ct]
+                        X_tra_ext = np.column_stack([X_tra_ext, all_preds_train_fold[dep_layer][:, ct]])
+                        X_val_ext = np.column_stack([X_val_ext, all_preds_val_fold[dep_layer][:, ct]])
+                    
+                    model = clone(self.base_estimator)
+                    model.fit(X_tra_ext, y_train_fold[:, i])
+                    p_train = model.predict(X_tra_ext)
+                    p_val = model.predict(X_val_ext)
+                    
+                    rmse_val = self._get_rmse(y_val_fold[:, i], p_val)
+                    if rmse_val + self.epsilon > error_val_i:
+                        return True, error_val_i, p_train, p_val, False
+                    else:
+                        return False, rmse_val, p_train, p_val, True
+                else:
+                    return True, error_val_i, all_preds_train_fold[rlayer-1][:, i], all_preds_val_fold[rlayer-1][:, i], False
+
             while not np.all(converged):
+                results_tracking = Parallel(n_jobs=self.n_jobs)(delayed(_train_predict_tracking)(
+                    i, converged[i], self.rf_importance_[i], X_train, y_train, X_val, y_val, conv_layers, all_preds_train, all_preds_val, error_val[i]
+                ) for i in range(self.n_targets_))
+                
                 new_preds_train = np.zeros_like(preds_train)
                 new_preds_val = np.zeros_like(preds_val)
-                for i in range(self.n_targets_):
-                    if not converged[i]:
-                        chosen_targets = np.where(self.rf_importance_[i])[0]
-                        X_tra_ext = X_train.copy()
-                        X_val_ext = X_val.copy()
-                        for ct in chosen_targets:
-                            # Use the latest available prediction for each chosen target
-                            # In the tracking phase, this is either from a previous layer or layer 0
-                            dep_layer = conv_layers[ct]
-                            X_tra_ext = np.column_stack([X_tra_ext, all_preds_train[dep_layer][:, ct]])
-                            X_val_ext = np.column_stack([X_val_ext, all_preds_val[dep_layer][:, ct]])
-                        
-                        model = clone(self.base_estimator)
-                        model.fit(X_tra_ext, y_train[:, i])
-                        p_train = model.predict(X_tra_ext)
-                        p_val = model.predict(X_val_ext)
-                        
-                        rmse_val = self._get_rmse(y_val[:, i], p_val)
-                        if rmse_val + self.epsilon > error_val[i]:
-                            converged[i] = True
-                        else:
-                            error_val[i] = rmse_val
-                            # Note: we don't update conv_layers[i] here yet, 
-                            # because all_preds_train[rlayer] is not yet populated.
-                            # We will update it after the loop.
-                            new_preds_train[:, i] = p_train
-                            new_preds_val[:, i] = p_val
-                    else:
-                        new_preds_train[:, i] = all_preds_train[rlayer-1][:, i]
-                        new_preds_val[:, i] = all_preds_val[rlayer-1][:, i]
+                
+                for i, (conv_i, err_i, p_train, p_val, improved) in enumerate(results_tracking):
+                    converged[i] = conv_i
+                    error_val[i] = err_i
+                    new_preds_train[:, i] = p_train
+                    new_preds_val[:, i] = p_val
+                    if improved:
+                        conv_layers[i] = rlayer
                 
                 all_preds_train[rlayer] = new_preds_train
                 all_preds_val[rlayer] = new_preds_val
-                
-                # Update conv_layers for targets that improved in this layer
-                for i in range(self.n_targets_):
-                    if not converged[i] and np.any(new_preds_train[:, i] != 0):
-                         conv_layers[i] = rlayer
-
                 rlayer += 1
                 if rlayer > 50: break
             
@@ -275,38 +295,42 @@ class DSTARS(BaseEstimator, RegressorMixin):
         all_preds = {}
         
         # Layer 0
-        for i in range(self.n_targets_):
+        def _train_final_layer0(i, X_full, y_full):
             model = clone(self.base_estimator)
-            model.fit(X, y[:, i])
-            preds[:, i] = model.predict(X)
+            model.fit(X_full, y_full[:, i])
+            return i, model, model.predict(X_full)
+
+        results_layer0 = Parallel(n_jobs=self.n_jobs)(delayed(_train_final_layer0)(i, X, y) for i in range(self.n_targets_))
+        for i, model, p_train in results_layer0:
             self.models_[(0, i)] = model
-            
+            preds[:, i] = p_train
         all_preds[0] = preds
         
         # Subsequent layers
+        def _train_final_subsequent(i, rlayer, conv_layers, rf_imp, X_full, y_full, all_preds_dict):
+            if conv_layers[i] >= rlayer:
+                chosen_targets = np.where(rf_imp)[0]
+                X_ext = X_full.copy()
+                for ct in chosen_targets:
+                    dep_layer = min(rlayer - 1, conv_layers[ct])
+                    X_ext = np.column_stack([X_ext, all_preds_dict[dep_layer][:, ct]])
+                
+                model = clone(self.base_estimator)
+                model.fit(X_ext, y_full[:, i])
+                return i, model, model.predict(X_ext)
+            else:
+                return i, None, all_preds_dict[rlayer-1][:, i]
+
         for rlayer in range(1, max_layer + 1):
             new_preds = np.zeros_like(preds)
-            for i in range(self.n_targets_):
-                # Only train if this target needs this layer or more
-                if self.convergence_layers_[i] >= rlayer:
-                    chosen_targets = np.where(self.rf_importance_[i])[0]
-                    X_ext = X.copy()
-                    for ct in chosen_targets:
-                        # Use the prediction from the layer determined for that target, 
-                        # but limited by the current layer we are building? 
-                        # R code: modelling.set.x[, (chosen.t) := predictions.modelling[, paste(chosen.layers[chosen.t], chosen.t, sep="."), with = F]]
-                        # chosen.layers[chosen.t] is the latest layer built for that target.
-                        
-                        # We need to keep track of what layer to use for each dependency
-                        dep_layer = min(rlayer - 1, self.convergence_layers_[ct])
-                        X_ext = np.column_stack([X_ext, all_preds[dep_layer][:, ct]])
-                        
-                    model = clone(self.base_estimator)
-                    model.fit(X_ext, y[:, i])
-                    new_preds[:, i] = model.predict(X_ext)
+            results_subsequent = Parallel(n_jobs=self.n_jobs)(delayed(_train_final_subsequent)(
+                i, rlayer, self.convergence_layers_, self.rf_importance_[i], X, y, all_preds
+            ) for i in range(self.n_targets_))
+            
+            for i, model, p_train in results_subsequent:
+                if model is not None:
                     self.models_[(rlayer, i)] = model
-                else:
-                    new_preds[:, i] = all_preds[rlayer-1][:, i]
+                new_preds[:, i] = p_train
             all_preds[rlayer] = new_preds
 
     def predict(self, X):
@@ -316,28 +340,38 @@ class DSTARS(BaseEstimator, RegressorMixin):
         max_layer = self.convergence_layers_.max()
         preds = np.zeros((X.shape[0], self.n_targets_))
         all_preds = {}
-        
-        # Layer 0
-        for i in range(self.n_targets_):
-            preds[:, i] = self.models_[(0, i)].predict(X)
+               # Layer 0
+        def _predict_layer0(i, X_input, models_dict):
+            return i, models_dict[(0, i)].predict(X_input)
+
+        results_layer0 = Parallel(n_jobs=self.n_jobs)(delayed(_predict_layer0)(i, X, self.models_) for i in range(self.n_targets_))
+        for i, p in results_layer0:
+            preds[:, i] = p
         all_preds[0] = preds
         
         # Subsequent layers
+        def _predict_subsequent(i, rlayer, conv_layers, rf_imp, X_input, all_preds_dict, models_dict):
+            if conv_layers[i] >= rlayer:
+                chosen_targets = np.where(rf_imp)[0]
+                X_ext = X_input.copy()
+                for ct in chosen_targets:
+                    dep_layer = min(rlayer - 1, conv_layers[ct])
+                    X_ext = np.column_stack([X_ext, all_preds_dict[dep_layer][:, ct]])
+                return i, models_dict[(rlayer, i)].predict(X_ext)
+            else:
+                return i, all_preds_dict[rlayer-1][:, i]
+
         for rlayer in range(1, max_layer + 1):
             new_preds = np.zeros_like(preds)
-            for i in range(self.n_targets_):
-                if self.convergence_layers_[i] >= rlayer:
-                    chosen_targets = np.where(self.rf_importance_[i])[0]
-                    X_ext = X.copy()
-                    for ct in chosen_targets:
-                        dep_layer = min(rlayer - 1, self.convergence_layers_[ct])
-                        X_ext = np.column_stack([X_ext, all_preds[dep_layer][:, ct]])
-                    new_preds[:, i] = self.models_[(rlayer, i)].predict(X_ext)
-                else:
-                    new_preds[:, i] = all_preds[rlayer-1][:, i]
+            results_subsequent = Parallel(n_jobs=self.n_jobs)(delayed(_predict_subsequent)(
+                i, rlayer, self.convergence_layers_, self.rf_importance_[i], X, all_preds, self.models_
+            ) for i in range(self.n_targets_))
+            
+            for i, p in results_subsequent:
+                new_preds[:, i] = p
             all_preds[rlayer] = new_preds
             
-        # Final result is the prediction from the specific convergence layer for each target
+        # Return prediction from the specific convergence layer for each target
         final_preds = np.zeros((X.shape[0], self.n_targets_))
         for i in range(self.n_targets_):
             final_preds[:, i] = all_preds[self.convergence_layers_[i]][:, i]
